@@ -1,0 +1,7 @@
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+boto3>=1.35,<2
+yt-dlp>=2025.1
+pydantic>=2.7,<3
+
+playwright==1.63.0
