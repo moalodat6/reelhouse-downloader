@@ -336,7 +336,7 @@ def browser_choices(page_url: str) -> list[dict]:
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "scanner": "browser-v2"}
 
 
 @app.post("/scan", dependencies=[Depends(authorized)])
