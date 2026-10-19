@@ -37,7 +37,7 @@ R2_PREFIX = os.getenv("R2_PREFIX", "videos/imported").strip("/")
 EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-import")
 LOCK = threading.RLock()
 app = FastAPI(title="Reelhouse Import Processor", docs_url=None, redoc_url=None)
-SCAN_VERSION = "player-diagnostics-v4"
+SCAN_VERSION = "player-host-diagnostics-v5"
 LOG = logging.getLogger("uvicorn.error")
 
 
@@ -358,6 +358,9 @@ def browser_discover(page_url: str, diagnostics: dict | None = None, trace: str 
         "media_responses_ok": 0,
         "media_responses_denied": 0,
         "http_errors": {},
+        "http_403_hosts": {},
+        "request_failure_hosts": {},
+        "blocked_request_hosts": {},
         "page_script_errors": 0,
         "popups_closed": 0,
         "media_candidates": 0,
@@ -420,12 +423,24 @@ def browser_discover(page_url: str, diagnostics: dict | None = None, trace: str 
             if code >= 400:
                 errors = diag['http_errors']
                 errors[str(code)] = errors.get(str(code), 0) + 1
+                if code == 403:
+                    host = (urlparse(res.url).hostname or 'unknown')[:100]
+                    h = diag['http_403_hosts']
+                    if host in h or len(h) < 15:
+                        h[host] = h.get(host, 0) + 1
             remember(res.url, ctype if code in (200,206) else '', res.request.headers.get('referer', ''))
         except Exception:
             pass
 
     def on_request_failed(req):
         diag['request_failures'] += 1
+        try:
+            host = (urlparse(req.url).hostname or 'non-https-request')[:100]
+            hosts = diag['request_failure_hosts']
+            if host in hosts or len(hosts) < 15:
+                hosts[host] = hosts.get(host, 0) + 1
+        except Exception:
+            pass
 
     try:
         with sync_playwright() as play:
@@ -438,14 +453,23 @@ def browser_discover(page_url: str, diagnostics: dict | None = None, trace: str 
                 context.set_default_timeout(1800)
 
                 def safe_route(route):
+                    def record_block():
+                        diag['network_requests_blocked'] += 1
+                        try:
+                            host = (urlparse(route.request.url).hostname or 'non-https-request')[:100]
+                            hosts = diag['blocked_request_hosts']
+                            if host in hosts or len(hosts) < 15:
+                                hosts[host] = hosts.get(host, 0) + 1
+                        except Exception:
+                            pass
                     try:
                         if check_public(route.request.url):
                             route.continue_()
                         else:
-                            diag['network_requests_blocked'] += 1
+                            record_block()
                             route.abort()
                     except Exception:
-                        diag['network_requests_blocked'] += 1
+                        record_block()
                         try:
                             route.abort()
                         except Exception:
