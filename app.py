@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -36,6 +37,34 @@ R2_PREFIX = os.getenv("R2_PREFIX", "videos/imported").strip("/")
 EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-import")
 LOCK = threading.RLock()
 app = FastAPI(title="Reelhouse Import Processor", docs_url=None, redoc_url=None)
+SCAN_VERSION = "player-diagnostics-v4"
+LOG = logging.getLogger("uvicorn.error")
+
+
+def safe_error(message: object) -> str:
+    """Strip tokenized URLs, bearer tokens, and control characters from diagnostics."""
+    result = str(message)
+    result = re.sub(r'https?://[^\s\"\'<>]+', '[URL hidden]', result, flags=re.I)
+    result = re.sub(r'(?i)(bearer\s+)\S+', r'\1[hidden]', result)
+    result = re.sub(r'(?i)\b(token|api[_-]?key|secret|sig|signature)=\S+', r'\1=[hidden]', result)
+    return re.sub(r'[\r\n\t]+', ' ', result)[:180]
+
+
+class PrivateYdlLogger:
+    """Prevent yt-dlp's default logger from printing signed URL query strings."""
+    def debug(self, message):
+        pass
+
+    def info(self, message):
+        pass
+
+    def warning(self, message):
+        LOG.warning("REELHOUSE_YTDLP warning=%s", safe_error(message))
+
+    def error(self, message):
+        LOG.warning("REELHOUSE_YTDLP error=%s", safe_error(message))
+
+
 
 
 class ScanInput(BaseModel):
@@ -130,7 +159,7 @@ def get_job(job_id: str):
 
 def ydl_opts():
     return {
-        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "quiet": True, "no_warnings": True, "logger": PrivateYdlLogger(), "noplaylist": True,
         "socket_timeout": 25, "retries": 2, "fragment_retries": 2,
         "skip_download": True,
         "ignoreerrors": False,
@@ -229,7 +258,7 @@ SERVER_CONTROLS = (
 )
 
 
-def _safe_click(frame, selectors, clicked: set[str]) -> bool:
+def _safe_click(frame, selectors, clicked: set[str], diagnostics=None, control_type="play") -> bool:
     """Click one media control; never follow links that navigate off-page."""
     for selector in selectors:
         try:
@@ -239,6 +268,9 @@ def _safe_click(frame, selectors, clicked: set[str]) -> bool:
                 key = f"{frame.url}|{selector}|{index}"
                 if key in clicked or not item.is_visible(timeout=650):
                     continue
+                if diagnostics is not None:
+                    k = control_type + "_visible"
+                    diagnostics[k] = min(100, diagnostics.get(k, 0) + 1)
                 # Do not follow outbound links, hidden ads, or clickable page overlays.
                 meta = item.evaluate("""el => ({
                     tag: el.tagName.toLowerCase(),
@@ -262,6 +294,9 @@ def _safe_click(frame, selectors, clicked: set[str]) -> bool:
                 clicked.add(key)
                 try:
                     item.click(timeout=1800)
+                    if diagnostics is not None:
+                        k = control_type + "_clicked"
+                        diagnostics[k] = diagnostics.get(k, 0) + 1
                     return True
                 except Exception:
                     # Mark attempted elements so a deceptive overlay can't loop forever.
@@ -294,23 +329,52 @@ def _dom_video_urls(frame) -> list[str]:
         return []
 
 
-def browser_discover(page_url: str) -> list[dict]:
-    """Watch media traffic after loading, activating Play, and switching player tabs.
+def browser_discover(page_url: str, diagnostics: dict | None = None, trace: str = "") -> list[dict]:
+    """Discover accessible media after deliberate Play and server-tab interactions.
 
-    Only finds accessible, unprotected HTTP media. Does not bypass DRM, login,
-    CAPTCHA, IP checks, or access restrictions. Never triggers download links.
+    Structured diagnostics are logged to Railway without full URLs, tokens,
+    request headers, cookies, page text, or video contents. No restrictions are bypassed.
     """
     from playwright.sync_api import sync_playwright
 
+    diag = diagnostics if diagnostics is not None else {}
+    diag.update({
+        "scanner": SCAN_VERSION,
+        "source_host": (urlparse(page_url).hostname or "")[:150],
+        "page_status": None,
+        "navigation": "not_started",
+        "frames": 0,
+        "frame_hosts": [],
+        "video_elements": 0,
+        "source_elements": 0,
+        "play_visible": 0,
+        "play_clicked": 0,
+        "server_visible": 0,
+        "server_clicked": 0,
+        "requests": 0,
+        "responses": 0,
+        "request_failures": 0,
+        "network_requests_blocked": 0,
+        "media_responses_ok": 0,
+        "media_responses_denied": 0,
+        "http_errors": {},
+        "page_script_errors": 0,
+        "popups_closed": 0,
+        "media_candidates": 0,
+        "media_hosts": [],
+    })
     found: dict[str, str] = {}
     host_cache = {}
     clicked_play: set[str] = set()
     clicked_server: set[str] = set()
 
+    def media_like(url: str, content_type: str = ""):
+        return bool(MEDIA_EXT.search(urlparse(url).path) or any(t in content_type.lower() for t in MEDIA_TYPES))
+
     def remember(url, content_type='', referer=''):
         if len(found) >= 24 or not isinstance(url, str) or not url.startswith('https://'):
             return
-        if MEDIA_EXT.search(urlparse(url).path) or any(t in content_type.lower() for t in MEDIA_TYPES):
+        if media_like(url, content_type):
             if url not in found or (referer and not found[url]):
                 found[url] = referer if isinstance(referer, str) and referer.startswith('https://') else ''
 
@@ -327,7 +391,7 @@ def browser_discover(page_url: str) -> list[dict]:
             try:
                 good = is_public_ip(host)
             except ValueError:
-                good = host not in ('localhost',) and not host.endswith(('.local','.internal','.localhost'))
+                good = host not in ('localhost',) and not host.endswith(('.local', '.internal', '.localhost'))
                 if good:
                     addrs = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
                     good = bool(addrs) and all(is_public_ip(a[4][0]) for a in addrs)
@@ -336,105 +400,153 @@ def browser_discover(page_url: str) -> list[dict]:
         except (ValueError, OSError):
             return False
 
-    with sync_playwright() as play:
-        browser = play.chromium.launch(headless=True, args=['--disable-dev-shm-usage'])
+    def on_request(req):
+        diag['requests'] += 1
         try:
-            context = browser.new_context(
-                service_workers='block', ignore_https_errors=False,
-                accept_downloads=False, java_script_enabled=True,
-            )
-            context.set_default_timeout(1800)
+            remember(req.url, referer=req.headers.get('referer', ''))
+        except Exception:
+            pass
 
-            def safe_route(route):
-                try:
-                    if check_public(route.request.url):
-                        route.continue_()
-                    else:
-                        route.abort()
-                except Exception:
-                    try:
-                        route.abort()
-                    except Exception:
-                        pass
+    def on_response(res):
+        diag['responses'] += 1
+        code = res.status
+        try:
+            ctype = res.headers.get('content-type', '')
+            if media_like(res.url, ctype):
+                if code in (200, 206):
+                    diag['media_responses_ok'] += 1
+                elif code >= 400:
+                    diag['media_responses_denied'] += 1
+            if code >= 400:
+                errors = diag['http_errors']
+                errors[str(code)] = errors.get(str(code), 0) + 1
+            remember(res.url, ctype if code in (200,206) else '', res.request.headers.get('referer', ''))
+        except Exception:
+            pass
 
-            context.route('**/*', safe_route)
-            # Collect stream URLs from network traffic in the page and its frames.
-            context.on('request', lambda req: remember(
-                req.url, referer=req.headers.get('referer', '')
-            ))
-            context.on('response', lambda res: remember(
-                res.url, res.headers.get('content-type', '') if res.status in (200,206) else '',
-                res.request.headers.get('referer', '')
-            ))
-            page = context.new_page()
-            page.on('dialog', lambda dialog: dialog.dismiss())
+    def on_request_failed(req):
+        diag['request_failures'] += 1
 
-            # Close advertising pop-ups; only the requested webpage is scanned.
-            def close_popup(popup):
-                if popup != page:
-                    try:
-                        popup.close()
-                    except Exception:
-                        pass
-
-            context.on('page', close_popup)
+    try:
+        with sync_playwright() as play:
+            browser = play.chromium.launch(headless=True, args=['--disable-dev-shm-usage'])
             try:
-                page.goto(page_url, wait_until='domcontentloaded', timeout=25000)
-            except Exception:
-                pass  # Partially loaded pages can still have working players.
+                context = browser.new_context(
+                    service_workers='block', ignore_https_errors=False,
+                    accept_downloads=False, java_script_enabled=True,
+                )
+                context.set_default_timeout(1800)
 
-            def frames():
-                return page.frames[:12]
+                def safe_route(route):
+                    try:
+                        if check_public(route.request.url):
+                            route.continue_()
+                        else:
+                            diag['network_requests_blocked'] += 1
+                            route.abort()
+                    except Exception:
+                        diag['network_requests_blocked'] += 1
+                        try:
+                            route.abort()
+                        except Exception:
+                            pass
 
-            def collect():
-                for frame in frames():
-                    for src in _dom_video_urls(frame):
-                        remember(src, referer=frame.url)
-                    _activate_video_elements(frame)
+                context.route('**/*', safe_route)
+                context.on('request', on_request)
+                context.on('response', on_response)
+                context.on('requestfailed', on_request_failed)
+                page = context.new_page()
+                page.on('dialog', lambda dialog: dialog.dismiss())
+                page.on('pageerror', lambda error: diag.__setitem__('page_script_errors', diag['page_script_errors'] + 1))
 
-            collect()
-            page.wait_for_timeout(1800)
-            collect()
+                def close_popup(popup):
+                    if popup != page:
+                        diag['popups_closed'] += 1
+                        try:
+                            popup.close()
+                        except Exception:
+                            pass
 
-            # Stage 1: click explicit Play buttons on the page and within embeds.
-            for frame in frames():
-                if _safe_click(frame, PLAY_CONTROLS, clicked_play):
-                    page.wait_for_timeout(1200)
-                    collect()
+                context.on('page', close_popup)
+                try:
+                    res = page.goto(page_url, wait_until='domcontentloaded', timeout=25000)
+                    diag['navigation'] = 'loaded' if res else 'no_response'
+                    diag['page_status'] = res.status if res else None
+                except Exception as exc:
+                    # Loading partially may be enough to inspect embedded players.
+                    diag['navigation'] = 'timeout' if 'Timeout' in type(exc).__name__ else 'navigation_error'
 
-            # Stage 2: activate up to four clearly identified source/server tabs.
-            # Tabs can create new iframes asynchronously, so refresh frames each pass.
-            if not found:
-                switches = 0
-                for _ in range(4):
-                    changed = False
+                def frames():
+                    return page.frames[:12]
+
+                def collect():
+                    diag['frames'] = max(diag['frames'], len(frames()))
                     for frame in frames():
-                        if switches >= 4:
-                            break
-                        if _safe_click(frame, SERVER_CONTROLS, clicked_server):
-                            changed = True
-                            switches += 1
-                            page.wait_for_timeout(900)
-                            collect()
-                            clicked_play.clear()  # new server may have a new Play overlay
-                            for subframe in frames():
-                                if _safe_click(subframe, PLAY_CONTROLS, clicked_play):
-                                    page.wait_for_timeout(900)
-                                    collect()
-                    if not changed or found:
-                        break
+                        try:
+                            count = frame.evaluate("""() => ({
+                                videos: document.querySelectorAll('video').length,
+                                sources: document.querySelectorAll('source').length
+                            })""")
+                            diag['video_elements'] = max(diag['video_elements'], int(count.get('videos', 0)))
+                            diag['source_elements'] = max(diag['source_elements'], int(count.get('sources', 0)))
+                        except Exception:
+                            pass
+                        for src in _dom_video_urls(frame):
+                            remember(src, referer=frame.url)
+                        _activate_video_elements(frame)
 
-            # Final window for player initialization and asynchronous manifests.
-            page.wait_for_timeout(2200)
-            collect()
-            context.close()
-        finally:
-            browser.close()
+                collect()
+                page.wait_for_timeout(1800)
+                collect()
+
+                # Activate only explicit media controls, never ad or offsite links.
+                for frame in frames():
+                    if _safe_click(frame, PLAY_CONTROLS, clicked_play, diag, 'play'):
+                        page.wait_for_timeout(1200)
+                        collect()
+
+                if not found:
+                    switches = 0
+                    for _ in range(4):
+                        changed = False
+                        for frame in frames():
+                            if switches >= 4:
+                                break
+                            if _safe_click(frame, SERVER_CONTROLS, clicked_server, diag, 'server'):
+                                changed = True
+                                switches += 1
+                                page.wait_for_timeout(900)
+                                collect()
+                                clicked_play.clear()
+                                for subframe in frames():
+                                    if _safe_click(subframe, PLAY_CONTROLS, clicked_play, diag, 'play'):
+                                        page.wait_for_timeout(900)
+                                        collect()
+                        if not changed or found:
+                            break
+
+                page.wait_for_timeout(2200)
+                collect()
+                diag['frame_hosts'] = sorted(set(
+                    (urlparse(frame.url).hostname or '')[:100] for frame in frames()
+                    if urlparse(frame.url).hostname
+                ))[:8]
+                context.close()
+            finally:
+                browser.close()
+    except Exception as ex:
+        # We report exception class, not a message that may include signed URLs.
+        diag['browser_exception_class'] = type(ex).__name__
+        raise
+    finally:
+        diag['media_candidates'] = len(found)
+        diag['media_hosts'] = sorted(set((urlparse(u).hostname or '')[:100] for u in found))[:8]
+        LOG.info('REELHOUSE_SCAN_DIAG trace=%s detail=%s', trace or 'unknown', json.dumps(diag, sort_keys=True))
     return [{"url": url, "referer": ref or page_url} for url, ref in found.items()]
 
 
-def browser_choices(page_url: str) -> list[dict]:
-    candidates = browser_discover(page_url)
+def browser_choices(page_url: str, diagnostics: dict | None = None, trace: str = "") -> list[dict]:
+    candidates = browser_discover(page_url, diagnostics=diagnostics, trace=trace)
     if not candidates:
         raise ValueError("No accessible MP4/HLS/DASH video streams were detected in this webpage or its frames")
 
@@ -486,33 +598,41 @@ def browser_choices(page_url: str) -> list[dict]:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "scanner": "player-activation-v3"}
+    return {"ok": True, "scanner": SCAN_VERSION}
 
 
 @app.post("/scan", dependencies=[Depends(authorized)])
 def scan(data: ScanInput):
     url = validate_url(data.url)
+    trace = uuid.uuid4().hex[:12]
+    LOG.info('REELHOUSE_SCAN_START trace=%s host=%s', trace, urlparse(url).hostname)
     media = {}
     direct_error = ""
     try:
         media = inspect_url(url)
         choices = pick_choices(media)
     except Exception as ex:
-        direct_error = str(ex)[:180]
+        direct_error = safe_error(ex)
+        LOG.info('REELHOUSE_DIRECT_UNSUPPORTED trace=%s reason=%s', trace, direct_error)
         choices = []
     if not choices:
+        details = {}
         try:
-            choices = browser_choices(url)
+            choices = browser_choices(url, diagnostics=details, trace=trace)
         except Exception as ex:
-            raise HTTPException(422, f"Neither direct extraction nor browser scanning worked. Browser: {str(ex)[:250]}. Direct: {direct_error[:80]}")
+            browser_error = safe_error(ex)
+            LOG.warning('REELHOUSE_SCAN_FAILED trace=%s browser_reason=%s', trace, browser_error)
+            # Short, safe summary visible in Reelhouse; detailed counters in Railway logs.
+            extra = f"Page={details.get('page_status') or details.get('navigation')}; frames={details.get('frames', 0)}; play clicks={details.get('play_clicked', 0)}; stream candidates={details.get('media_candidates', 0)}"
+            raise HTTPException(422, f"Scan failed (trace {trace}). {browser_error}. {extra}. See Railway logs for REELHOUSE_SCAN_DIAG.")
     sid = str(uuid.uuid4())
     title = str(media.get("title") or "Untitled")[:250]
     poster = str(media.get("thumbnail") or "")[:2048]
     with LOCK, connect() as c:
         c.execute("DELETE FROM scans WHERE created<?", (time.time() - 3600,))
         c.execute("INSERT INTO scans VALUES(?,?,?,?,?,?)", (sid, url, json.dumps(choices), title, poster, time.time()))
-    # Never return discovered media URLs or any internal backend fields to the browser.
     public_choices = [{k: v for k, v in row.items() if not k.startswith("_")} for row in choices]
+    LOG.info('REELHOUSE_SCAN_SUCCESS trace=%s available_qualities=%d', trace, len(public_choices))
     return {"scanId": sid, "title": title, "poster": poster, "description": str(media.get("description") or "")[:5000], "suggestedCategories": (media.get("categories") or [])[:20], "qualities": public_choices}
 
 
