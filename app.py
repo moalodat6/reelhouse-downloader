@@ -195,48 +195,156 @@ MEDIA_EXT = re.compile(r"\.(?:m3u8|mpd|mp4|webm)(?:$|[?#])", re.I)
 MEDIA_TYPES = ("application/vnd.apple.mpegurl", "application/x-mpegurl", "application/dash+xml", "video/mp4", "video/webm")
 
 
-def browser_discover(page_url: str) -> list[str]:
-    """Watch network requests from the page and its embedded frames."""
+# Controlled interaction: explicitly marked Play controls and video-server tabs only.
+# Never click arbitrary page buttons, login/paywall controls, or offsite download links.
+PLAY_CONTROLS = (
+    'button[aria-label*="play" i]',
+    '[role="button"][aria-label*="play" i]',
+    'button[title*="play" i]',
+    '.vjs-big-play-button',
+    '.plyr__control--overlaid',
+    '.jw-display-icon-container',
+    '.jw-icon-display',
+    '.dplayer-play-icon',
+    '.fp-play',
+    '.art-state',
+    '.play-button',
+    '[class~="play-icon"]',
+    'button:has-text("Play Movie")',
+    'button:has-text("Play Video")',
+    'button:has-text("Play Now")',
+    'button:has-text("Play")',
+    '[role="button"]:has-text("Play")',
+)
+SERVER_CONTROLS = (
+    '[role="tab"][data-server]',
+    'button[data-server]',
+    'button[data-embed]',
+    'button[data-source]',
+    '[class*="server" i] button',
+    '[class*="server" i] [role="tab"]',
+    '[class*="player-list" i] button',
+    '[class*="source-list" i] button',
+    '[class*="server" i] [role="button"]',
+)
+
+
+def _safe_click(frame, selectors, clicked: set[str]) -> bool:
+    """Click one media control; never follow links that navigate off-page."""
+    for selector in selectors:
+        try:
+            loc = frame.locator(selector)
+            for index in range(min(loc.count(), 5)):
+                item = loc.nth(index)
+                key = f"{frame.url}|{selector}|{index}"
+                if key in clicked or not item.is_visible(timeout=650):
+                    continue
+                # Do not follow outbound links, hidden ads, or clickable page overlays.
+                meta = item.evaluate("""el => ({
+                    tag: el.tagName.toLowerCase(),
+                    aria: (el.getAttribute('aria-label') || '').toLowerCase(),
+                    text: (el.innerText || '').trim().slice(0, 90).toLowerCase(),
+                    href: el.getAttribute('href') || '',
+                    disabled: Boolean(el.disabled),
+                })""")
+                if meta['disabled']:
+                    continue
+                if meta['tag'] == 'a' and not (
+                    not meta['href'] or meta['href'].startswith('#')
+                    or meta['href'].lower().replace(' ', '') in ('javascript:void(0)', 'javascript:;')
+                ):
+                    continue
+                if any(x in meta['text'] for x in ('sign in', 'login', 'subscribe', 'pay now', 'report broken')):
+                    continue
+                rect = item.bounding_box(timeout=650)
+                if not rect or rect['width'] < 12 or rect['height'] < 12:
+                    continue
+                clicked.add(key)
+                try:
+                    item.click(timeout=1800)
+                    return True
+                except Exception:
+                    # Mark attempted elements so a deceptive overlay can't loop forever.
+                    continue
+        except Exception:
+            continue
+    return False
+
+
+def _activate_video_elements(frame):
+    """Start already-created media elements without requiring user gestures."""
+    try:
+        frame.evaluate("""() => document.querySelectorAll('video').forEach(v => {
+            v.muted = true;
+            v.play().catch(() => {});
+        })""")
+    except Exception:
+        pass
+
+
+def _dom_video_urls(frame) -> list[str]:
+    """Read only real media/source elements, not arbitrary script text."""
+    try:
+        sources = frame.evaluate("""() => Array.from(document.querySelectorAll('video,source'))
+            .flatMap(el => [el.currentSrc, el.src, el.getAttribute('src'),
+                            el.getAttribute('data-src')])
+            .filter(Boolean)""")
+        return [urljoin(frame.url, s) for s in sources if isinstance(s, str)]
+    except Exception:
+        return []
+
+
+def browser_discover(page_url: str) -> list[dict]:
+    """Watch media traffic after loading, activating Play, and switching player tabs.
+
+    Only finds accessible, unprotected HTTP media. Does not bypass DRM, login,
+    CAPTCHA, IP checks, or access restrictions. Never triggers download links.
+    """
     from playwright.sync_api import sync_playwright
 
-    found: dict[str, None] = {}
-    cache = {}
-    def remember(url, content_type=""):
-        if len(found) >= 24 or not isinstance(url, str) or not url.startswith("https://"):
+    found: dict[str, str] = {}
+    host_cache = {}
+    clicked_play: set[str] = set()
+    clicked_server: set[str] = set()
+
+    def remember(url, content_type='', referer=''):
+        if len(found) >= 24 or not isinstance(url, str) or not url.startswith('https://'):
             return
         if MEDIA_EXT.search(urlparse(url).path) or any(t in content_type.lower() for t in MEDIA_TYPES):
-            found[url] = None
+            if url not in found or (referer and not found[url]):
+                found[url] = referer if isinstance(referer, str) and referer.startswith('https://') else ''
 
     def check_public(url):
-        u = urlparse(url)
-        if u.scheme in ("data", "blob", "about"):
-            return True
-        if u.scheme != "https" or not u.hostname or u.username or u.password or u.port not in (None, 443):
-            return False
-        host = u.hostname.lower().rstrip(".")
-        if host in cache:
-            return cache[host]
         try:
+            u = urlparse(url)
+            if u.scheme in ('data', 'blob', 'about'):
+                return True
+            if u.scheme != 'https' or not u.hostname or u.username or u.password or u.port not in (None, 443):
+                return False
+            host = u.hostname.lower().rstrip('.')
+            if host in host_cache:
+                return host_cache[host]
             try:
-                result = is_public_ip(host)
+                good = is_public_ip(host)
             except ValueError:
-                result = not (host == "localhost" or host.endswith((".local", ".internal", ".localhost")))
-                if result:
+                good = host not in ('localhost',) and not host.endswith(('.local','.internal','.localhost'))
+                if good:
                     addrs = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-                    result = bool(addrs) and all(is_public_ip(addr[4][0]) for addr in addrs)
+                    good = bool(addrs) and all(is_public_ip(a[4][0]) for a in addrs)
+            host_cache[host] = good
+            return good
         except (ValueError, OSError):
-            result = False
-        cache[host] = result
-        return result
+            return False
 
     with sync_playwright() as play:
-        browser = play.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+        browser = play.chromium.launch(headless=True, args=['--disable-dev-shm-usage'])
         try:
             context = browser.new_context(
-                service_workers="block", ignore_https_errors=False,
+                service_workers='block', ignore_https_errors=False,
                 accept_downloads=False, java_script_enabled=True,
             )
-            context.set_default_timeout(6000)
+            context.set_default_timeout(1800)
+
             def safe_route(route):
                 try:
                     if check_public(route.request.url):
@@ -244,45 +352,85 @@ def browser_discover(page_url: str) -> list[str]:
                     else:
                         route.abort()
                 except Exception:
-                    try: route.abort()
-                    except Exception: pass
-            context.route("**/*", safe_route)
-            context.on("request", lambda req: remember(req.url))
-            context.on("response", lambda res: remember(
-                res.url, res.headers.get("content-type", "") if res.status in (200, 206) else ""
+                    try:
+                        route.abort()
+                    except Exception:
+                        pass
+
+            context.route('**/*', safe_route)
+            # Collect stream URLs from network traffic in the page and its frames.
+            context.on('request', lambda req: remember(
+                req.url, referer=req.headers.get('referer', '')
+            ))
+            context.on('response', lambda res: remember(
+                res.url, res.headers.get('content-type', '') if res.status in (200,206) else '',
+                res.request.headers.get('referer', '')
             ))
             page = context.new_page()
+            page.on('dialog', lambda dialog: dialog.dismiss())
+
+            # Close advertising pop-ups; only the requested webpage is scanned.
+            def close_popup(popup):
+                if popup != page:
+                    try:
+                        popup.close()
+                    except Exception:
+                        pass
+
+            context.on('page', close_popup)
             try:
-                page.goto(page_url, wait_until="domcontentloaded", timeout=25000)
+                page.goto(page_url, wait_until='domcontentloaded', timeout=25000)
             except Exception:
-                # Player scripts can still load after a navigation timeout.
-                pass
-            for frame in page.frames[:12]:
-                try:
-                    sources = frame.evaluate("""() => Array.from(document.querySelectorAll('video,source'))
-                        .flatMap(el => [el.currentSrc, el.src, el.getAttribute('src')])
-                        .filter(Boolean)""")
-                    for src in sources:
-                        remember(urljoin(frame.url, src))
-                    frame.evaluate("""() => document.querySelectorAll('video').forEach(v => {
-                        v.muted = true; v.play().catch(() => {});
-                    })""")
-                except Exception:
-                    pass
-            page.wait_for_timeout(6500)
-            for frame in page.frames[:12]:
-                try:
-                    sources = frame.evaluate("""() => Array.from(document.querySelectorAll('video,source'))
-                        .flatMap(el => [el.currentSrc, el.src, el.getAttribute('src')])
-                        .filter(Boolean)""")
-                    for src in sources:
-                        remember(urljoin(frame.url, src))
-                except Exception:
-                    pass
+                pass  # Partially loaded pages can still have working players.
+
+            def frames():
+                return page.frames[:12]
+
+            def collect():
+                for frame in frames():
+                    for src in _dom_video_urls(frame):
+                        remember(src, referer=frame.url)
+                    _activate_video_elements(frame)
+
+            collect()
+            page.wait_for_timeout(1800)
+            collect()
+
+            # Stage 1: click explicit Play buttons on the page and within embeds.
+            for frame in frames():
+                if _safe_click(frame, PLAY_CONTROLS, clicked_play):
+                    page.wait_for_timeout(1200)
+                    collect()
+
+            # Stage 2: activate up to four clearly identified source/server tabs.
+            # Tabs can create new iframes asynchronously, so refresh frames each pass.
+            if not found:
+                switches = 0
+                for _ in range(4):
+                    changed = False
+                    for frame in frames():
+                        if switches >= 4:
+                            break
+                        if _safe_click(frame, SERVER_CONTROLS, clicked_server):
+                            changed = True
+                            switches += 1
+                            page.wait_for_timeout(900)
+                            collect()
+                            clicked_play.clear()  # new server may have a new Play overlay
+                            for subframe in frames():
+                                if _safe_click(subframe, PLAY_CONTROLS, clicked_play):
+                                    page.wait_for_timeout(900)
+                                    collect()
+                    if not changed or found:
+                        break
+
+            # Final window for player initialization and asynchronous manifests.
+            page.wait_for_timeout(2200)
+            collect()
             context.close()
         finally:
             browser.close()
-    return list(found)
+    return [{"url": url, "referer": ref or page_url} for url, ref in found.items()]
 
 
 def browser_choices(page_url: str) -> list[dict]:
@@ -293,29 +441,31 @@ def browser_choices(page_url: str) -> list[dict]:
     accepted = []
     unapproved = set()
     for candidate in candidates:
-        host = urlparse(candidate).hostname or ""
+        media_url = candidate["url"] if isinstance(candidate, dict) else candidate
+        referer = candidate.get("referer", page_url) if isinstance(candidate, dict) else page_url
+        host = urlparse(media_url).hostname or ""
         if not any(host == h or host.endswith("." + h) for h in MEDIA_HOSTS):
             unapproved.add(host)
             continue
         try:
-            validate_url(candidate, MEDIA_HOSTS)
+            validate_url(media_url, MEDIA_HOSTS)
         except HTTPException:
             continue
-        accepted.append(candidate)
+        accepted.append((media_url, referer))
     if not accepted:
         hosts = ", ".join(sorted(unapproved)[:3])
         raise ValueError("Video streams were detected on other host(s): " + hosts + ". Add only trusted, authorized hosts to ALLOWED_MEDIA_HOSTS")
 
     all_choices = []
-    for media_url in accepted[:4]:
+    for media_url, referer in accepted[:4]:
         try:
-            info = inspect_url(media_url, referer=page_url)
+            info = inspect_url(media_url, referer=referer)
             for choice in pick_choices(info):
                 choice = dict(choice)
                 # IDs are opaque; the actual source and format are stored server-side.
                 choice["_download_url"] = media_url
                 choice["_download_format"] = choice["id"]
-                choice["_referer"] = page_url
+                choice["_referer"] = referer
                 choice["id"] = uuid.uuid4().hex
                 all_choices.append(choice)
         except Exception:
@@ -336,7 +486,7 @@ def browser_choices(page_url: str) -> list[dict]:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "scanner": "browser-v2"}
+    return {"ok": True, "scanner": "player-activation-v3"}
 
 
 @app.post("/scan", dependencies=[Depends(authorized)])
